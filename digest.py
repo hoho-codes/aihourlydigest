@@ -51,14 +51,16 @@ WORKDIR = "assets/digest"
 FINAL_VIDEO = "assets/hourly_digest.mp4"
 
 NUM_STORIES = 5
+MAX_VIDEO_SECONDS = 120  # hard ceiling on total video length
+WORDS_PER_SECOND = 2.5   # rough natural speech rate, used to size per-story word targets
 YT_TITLE_MAX_LEN = 100
 SHORTS_TAG = " #Shorts"
 
 VIDEO_WIDTH = 1080
 VIDEO_HEIGHT = 1920  # 9:16, standard Shorts frame
 
-TITLE_FONT_SIZE = 54
-TITLE_TOP_MARGIN = 140  # px from top of frame -- "near the top"
+TITLE_FONT_SIZE = 54  # unused now -- font size is computed dynamically per facts.py's word-count rule
+TITLE_TOP_MARGIN = 280  # matches facts.py's top-caption top_padding default
 TITLE_FONT_PATH = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
 
 CAPTION_COLOR_PALETTES = [
@@ -283,29 +285,38 @@ def rank_five_stories_with_groq(articles: list[dict]) -> list[dict]:
 # 2. Write a ~60-second script for each story
 # ---------------------------------------------------------------------------
 
-def write_60s_script(article: dict, position: int, total: int) -> str:
+def write_segment_script(article: dict, position: int, total: int) -> str:
     """
-    Writes a ~60-second (roughly 140-160 word) narration script for one
-    story in the countdown/list. Falls back to a plain readback of title +
-    description if Groq is unavailable or fails after retries.
+    Writes a short narration script for one story in the countdown/list.
+    Word target is sized so that all `total` segments together keep the
+    whole video under MAX_VIDEO_SECONDS (2 minutes): ~2.5 words/sec of
+    natural speech, split evenly across stories, minus a small buffer.
+    Falls back to a plain readback of title + description if Groq is
+    unavailable or fails after retries.
     """
     raw_text = f"Title: {article['title']}\nDescription: {article['description']}"
-    fallback = f"Story {position} of {total}. {article['title']}. {article['description']}".strip()
+    fallback = f"Story {position} of {total}. {article['title']}."
 
     if not GROQ_API_KEY:
-        print("No GROQ_API_KEY set; using title + description unmodified.")
+        print("No GROQ_API_KEY set; using title unmodified.")
         return fallback
 
+    seconds_per_story = (MAX_VIDEO_SECONDS * 0.9) / total  # 10% buffer for pacing/pauses
+    words_per_story = int(seconds_per_story * WORDS_PER_SECOND)
+    low, high = max(words_per_story - 10, 15), words_per_story + 5
+
     system_instruction = (
-        f"You write narration for story #{position} of {total} in an hourly "
-        "news countdown video. Given a news title and description, write a "
-        "spoken-language script of roughly 140-160 words (about 60 seconds "
-        "of narration at a natural pace) that explains the story clearly: "
-        "what happened, key facts, and why it matters. Stay strictly neutral "
-        "and factual -- do not add claims, speculation, or detail beyond the "
-        "source text; if the description is thin, stay general rather than "
-        "inventing specifics. Open by briefly naming the story, then explain "
-        "it. No hashtags, no emojis, no quotation marks, no headers, no "
+        f"You write narration for story #{position} of {total} in a news "
+        "countdown video. The ENTIRE video across all stories must stay "
+        f"under {MAX_VIDEO_SECONDS} seconds total, so THIS story's script "
+        f"must be short: roughly {low}-{high} words, no more. Given a news "
+        "title and description, write a tight, spoken-language script that "
+        "states what happened and the single most important detail -- do "
+        "not try to cover everything, pick the one thing that matters most. "
+        "Stay strictly neutral and factual -- do not add claims, "
+        "speculation, or detail beyond the source text; if the description "
+        "is thin, stay general rather than inventing specifics. No "
+        "hashtags, no emojis, no quotation marks, no headers, no "
         "'story 1 of 5' framing -- that's added separately. Return ONLY the "
         "narration script, nothing else."
     )
@@ -325,7 +336,7 @@ def write_60s_script(article: dict, position: int, total: int) -> str:
                         {"role": "system", "content": system_instruction},
                         {"role": "user", "content": raw_text},
                     ],
-                    "max_tokens": 400,
+                    "max_tokens": 150,
                     "temperature": 0.7,
                     "reasoning_effort": "low",
                 },
@@ -335,11 +346,15 @@ def write_60s_script(article: dict, position: int, total: int) -> str:
             script = res.json()["choices"][0]["message"]["content"].strip().strip('"')
             if not script:
                 raise ValueError("Groq returned an empty script")
-            print(f"Script for story {position}: {script[:80]}...")
+            word_count = len(script.split())
+            if word_count > high + 15:  # generous slack before we bother truncating
+                print(f"Warning: script for story {position} ran long ({word_count} words, target {low}-{high}); trimming.")
+                script = " ".join(script.split()[:high])
+            print(f"Script for story {position} ({word_count} words): {script[:80]}...")
             return script
         except Exception as e:
             last_err = e
-            print(f"write_60s_script attempt {attempt + 1} failed ({e}); retrying...")
+            print(f"write_segment_script attempt {attempt + 1} failed ({e}); retrying...")
 
     print(f"Groq scripting failed after retries ({last_err}); using fallback readback.")
     return fallback
@@ -465,35 +480,84 @@ def get_audio_duration(path: str) -> float:
 # ---------------------------------------------------------------------------
 
 def escape_drawtext(text: str) -> str:
+    """
+    Escapes characters that break ffmpeg's drawtext filter syntax.
+    Same escaping as facts.py's _escape_drawtext.
+    """
+    text = text.replace("\\", "\\\\")
+    text = text.replace(":", "\\:")
+    text = text.replace("'", "\u2019")
+    text = text.replace(",", "\\,")
+    text = text.replace("%", "\\%")
+    return text
+
+
+def build_title_caption_filter(
+    text: str,
+    caption_file_path: str,
+    font_path: str = TITLE_FONT_PATH,
+    out_w: int = VIDEO_WIDTH,
+    top_padding: int = TITLE_TOP_MARGIN,
+    palette: dict = None,
+) -> str:
+    """
+    Builds the drawtext filter for the segment's title caption, using the
+    exact same sizing/wrapping/positioning rules as facts.py's top-caption
+    style (_build_single_caption_filter with position="top"): font size
+    scales down as word count grows, text is wrapped to a textfile so long
+    titles don't overflow the frame width, and it's placed top_padding px
+    from the top with a shadow + bordered outline.
+    """
+    escaped = escape_drawtext(text)
+
+    word_count = len(text.split())
+    if word_count <= 5:
+        font_size = 100
+    elif word_count <= 10:
+        font_size = 80
+    else:
+        font_size = 64
+
+    avg_char_width_px = font_size * 0.58
+    usable_width_px = out_w - 80
+    wrap_width_chars = max(int(usable_width_px / avg_char_width_px), 8)
+
+    wrapped = textwrap.fill(escaped, width=wrap_width_chars)
+    with open(caption_file_path, "w", encoding="utf-8") as f:
+        f.write(wrapped)
+
+    palette = palette or random.choice(CAPTION_COLOR_PALETTES)
+
     return (
-        text.replace("\\", "\\\\")
-        .replace(":", "\\:")
-        .replace("'", "\u2019")  # avoid breaking ffmpeg's quoting
-        .replace("%", "\\%")
+        f"drawtext=fontfile={font_path}:textfile={caption_file_path}:"
+        f"fontsize={font_size}:fontcolor={palette['fontcolor']}:"
+        f"borderw=3:bordercolor={palette['bordercolor']}:"
+        f"shadowcolor=black@0.9:shadowx=3:shadowy=3:"
+        f"text_align=C:"
+        f"x=(w-text_w)/2:y={top_padding}:line_spacing=16"
     )
 
 
 def build_segment(article: dict, image_path: str, audio_path: str, position: int, out_path: str) -> str:
     """
-    Builds one vertical video segment: the article's image, scaled/cropped
-    to fill the frame, held for the exact length of its narration audio,
-    with the short title burned in near the top of the frame.
+    Builds one vertical video segment: the article's image, scaled to fit
+    fully inside the frame (letterboxed with black bars, never cropped),
+    held for the exact length of its narration audio, with the short title
+    burned in near the top of the frame -- same font-size/wrap/position/
+    shadow style as facts.py's top caption.
     """
     duration = get_audio_duration(audio_path)
     palette = CAPTION_COLOR_PALETTES[position % len(CAPTION_COLOR_PALETTES)]
-    title_text = escape_drawtext(f"{position + 1}/{NUM_STORIES}  {make_short_title(article)}")
+    title_text = f"{position + 1}/{NUM_STORIES}  {make_short_title(article)}"
 
-    drawtext = (
-        f"drawtext=fontfile={TITLE_FONT_PATH}:text='{title_text}':"
-        f"fontsize={TITLE_FONT_SIZE}:fontcolor={palette['fontcolor']}:"
-        f"bordercolor={palette['bordercolor']}:borderw=3:"
-        f"x=(w-text_w)/2:y={TITLE_TOP_MARGIN}:"
-        "line_spacing=8"
+    caption_file_path = f"{WORKDIR}/caption_title_{position}.txt"
+    drawtext = build_title_caption_filter(
+        title_text, caption_file_path, palette=palette,
     )
 
     vf = (
-        f"scale={VIDEO_WIDTH}:{VIDEO_HEIGHT}:force_original_aspect_ratio=increase,"
-        f"crop={VIDEO_WIDTH}:{VIDEO_HEIGHT},"
+        f"scale={VIDEO_WIDTH}:{VIDEO_HEIGHT}:force_original_aspect_ratio=decrease,"
+        f"pad={VIDEO_WIDTH}:{VIDEO_HEIGHT}:(ow-iw)/2:(oh-ih)/2:color=black,"
         f"{drawtext}"
     )
 
@@ -529,7 +593,14 @@ def concatenate_segments(segment_paths: list[str], out_path: str = FINAL_VIDEO) 
         out_path,
     ]
     subprocess.run(cmd, check=True)
-    print(f"Final digest video assembled -> {out_path}")
+    total_duration = get_audio_duration(out_path)  # works for video files too, ffprobe reads any media
+    print(f"Final digest video assembled -> {out_path} ({total_duration:.1f}s total)")
+    if total_duration > MAX_VIDEO_SECONDS:
+        print(
+            f"Warning: final video is {total_duration:.1f}s, over the "
+            f"{MAX_VIDEO_SECONDS}s target -- Groq's per-story word targets "
+            "may need tightening, or fewer stories per digest."
+        )
     return out_path
 
 # ---------------------------------------------------------------------------
@@ -572,7 +643,7 @@ def build_hourly_digest() -> tuple[str, str, str]:
             print(f"Skipping story (no usable image): {article['title']}")
             continue
 
-        script = write_60s_script(article, position=position + 1, total=len(ranked))
+        script = write_segment_script(article, position=position + 1, total=len(ranked))
         audio_path = generate_narration(script, out_path=f"{WORKDIR}/audio_{position}.mp3")
         segment_path = build_segment(
             article, image_path, audio_path, position=position,
