@@ -771,11 +771,11 @@ def main():
 
     # res = publish_to_youtube(video_path, title, description)
 
-    if res is not None and res.ok:
-        print(f"Uploaded Short: {res.json().get('id')}")
-    else:
-        print("YouTube upload failed; see error above.")
-        raise SystemExit(1)
+    #if res is not None and res.ok:
+    #    print(f"Uploaded Short: {res.json().get('id')}")
+    #else:
+    #    print("YouTube upload failed; see error above.")
+    #    raise SystemExit(1)
 
 
 if __name__ == "__main__":
