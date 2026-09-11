@@ -464,11 +464,12 @@ def download_article_image(article: dict, out_path: str) -> str | None:
 # 4. Narration audio
 # ---------------------------------------------------------------------------
 
-async def _synthesize_speech(text: str, out_path: str, voice: str = "en-US-GuyNeural") -> None:
+NARRATION_VOICE = "en-IN-NeerjaNeural"  # or "en-IN-PrabhatNeural" for a male voice
+
+async def _synthesize_speech(text: str, out_path: str, voice: str = NARRATION_VOICE) -> None:
     import edge_tts
     communicate = edge_tts.Communicate(text, voice)
     await communicate.save(out_path)
-
 
 def generate_narration(script: str, out_path: str) -> str:
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
