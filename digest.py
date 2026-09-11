@@ -42,6 +42,7 @@ NEWS_COUNTRY = "in"  # ISO 3166-1 alpha-2 -- restricts both APIs to India
 NEWSDATA_API_KEY = os.environ.get("NEWSDATA_API_KEY", "")
 CURRENTS_API_KEY = os.environ.get("CURRENTS_API_KEY", "")
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
+PEXELS_API_KEY = os.environ.get("PEXELS_API_KEY", "")
 
 YT_CLIENT_ID = os.environ["YT_CLIENT_ID"]
 YT_CLIENT_SECRET = os.environ["YT_CLIENT_SECRET"]
@@ -465,6 +466,95 @@ def download_article_image(article: dict, out_path: str) -> str | None:
     print(f"Failed to download article image after retries ({last_err}).")
     return None
 
+def build_image_search_query_with_groq(article: dict) -> str:
+    """
+    Turns a news article into a short, generic stock-photo search query --
+    the TOPIC or SETTING of the story, not the specific event, since a
+    stock library won't have a picture of that exact incident.
+    """
+    raw_text = f"Title: {article['title']}\nDescription: {article['description']}"
+    fallback = " ".join(article["title"].split()[:4])
+
+    if not GROQ_API_KEY:
+        return fallback
+
+    system_instruction = (
+        "You turn news headlines into short stock-photo search queries. "
+        "Given a news title and description, return a 2-5 word generic "
+        "search query describing the topic or setting of the story (e.g. "
+        "'parliament building', 'cricket stadium crowd', 'stock market "
+        "screen', 'monsoon city street') -- not the specific event, named "
+        "people, or incident. Return ONLY the search query, nothing else."
+    )
+
+    try:
+        res = requests.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
+            json={
+                "model": "openai/gpt-oss-20b",
+                "messages": [
+                    {"role": "system", "content": system_instruction},
+                    {"role": "user", "content": raw_text},
+                ],
+                "max_tokens": 100,
+                "temperature": 0.7,
+                "reasoning_effort": "low",
+            },
+            timeout=30,
+        )
+        res.raise_for_status()
+        query = res.json()["choices"][0]["message"]["content"].strip().strip('"')
+        return query or fallback
+    except Exception as e:
+        print(f"build_image_search_query_with_groq failed ({e}); using fallback query.")
+        return fallback
+
+
+def fetch_stock_image(article: dict, out_path: str) -> str | None:
+    """
+    Replaces download_article_image(): searches Pexels for a generic,
+    properly-licensed image matching the story's topic instead of
+    hotlinking the article's own publisher-owned photo. Returns out_path
+    on success, or None if there's no usable result.
+    """
+    if not PEXELS_API_KEY:
+        print("No PEXELS_API_KEY set; skipping stock photo search.")
+        return None
+
+    query = build_image_search_query_with_groq(article)
+    print(f"Stock photo search query: {query!r}")
+
+    last_err = None
+    for attempt in range(3):
+        try:
+            res = requests.get(
+                PEXELS_SEARCH_URL,
+                headers={"Authorization": PEXELS_API_KEY},
+                params={"query": query, "per_page": 1, "orientation": "portrait"},
+                timeout=15,
+            )
+            res.raise_for_status()
+            photos = res.json().get("photos", [])
+            if not photos:
+                print(f"No Pexels results for query {query!r}.")
+                return None
+
+            image_url = photos[0]["src"]["large2x"]
+            img_res = requests.get(image_url, timeout=20)
+            img_res.raise_for_status()
+            os.makedirs(os.path.dirname(out_path), exist_ok=True)
+            with open(out_path, "wb") as f:
+                f.write(img_res.content)
+            print(f"Downloaded stock photo to {out_path}")
+            return out_path
+        except Exception as e:
+            last_err = e
+            print(f"fetch_stock_image attempt {attempt + 1} failed ({e}); retrying...")
+
+    print(f"Stock photo fetch failed after retries ({last_err}).")
+    return None
+
 # ---------------------------------------------------------------------------
 # 4. Narration audio
 # ---------------------------------------------------------------------------
@@ -825,9 +915,9 @@ def build_hourly_digest() -> tuple[str, str, str]:
             break
 
         position = len(used_stories)
-        image_path = download_article_image(article, out_path=f"{WORKDIR}/image_{position}.png")
+        image_path = fetch_stock_image(article, out_path=f"{WORKDIR}/image_{position}.jpg")
         if image_path is None:
-            print(f"Skipping story (no usable image): {article['title']}")
+            print(f"Skipping story (no stock photo match): {article['title']}")
             continue
 
         script = write_segment_script(article, position=position + 1, total=NUM_STORIES)
