@@ -37,6 +37,7 @@ import requests
 
 NEWSDATA_API_URL = "https://newsdata.io/api/1/latest"
 CURRENTS_API_URL = "https://api.currentsapi.services/v1/latest-news"
+NEWS_COUNTRY = "in"  # ISO 3166-1 alpha-2 -- restricts both APIs to India
 
 NEWSDATA_API_KEY = os.environ.get("NEWSDATA_API_KEY", "")
 CURRENTS_API_KEY = os.environ.get("CURRENTS_API_KEY", "")
@@ -113,7 +114,7 @@ def _normalize_currents_article(item: dict) -> dict | None:
     }
 
 
-def fetch_from_newsdata(n: int, category: str = "top", language: str = "en") -> list[dict]:
+def fetch_from_newsdata(n: int, category: str = "top", language: str = "en", country: str = NEWS_COUNTRY) -> list[dict]:
     if not NEWSDATA_API_KEY:
         print("No NEWSDATA_API_KEY set; skipping NewsData.io.")
         return []
@@ -128,6 +129,7 @@ def fetch_from_newsdata(n: int, category: str = "top", language: str = "en") -> 
                     "apikey": NEWSDATA_API_KEY,
                     "language": language,
                     "category": category,
+                    "country": country,
                 },
                 timeout=15,
             )
@@ -154,7 +156,7 @@ def fetch_from_newsdata(n: int, category: str = "top", language: str = "en") -> 
     return articles
 
 
-def fetch_from_currents(n: int, category: str = "world", language: str = "en") -> list[dict]:
+def fetch_from_currents(n: int, category: str = "world", language: str = "en", country: str = NEWS_COUNTRY) -> list[dict]:
     if not CURRENTS_API_KEY:
         print("No CURRENTS_API_KEY set; skipping Currents API.")
         return []
@@ -169,6 +171,7 @@ def fetch_from_currents(n: int, category: str = "world", language: str = "en") -
                     "apiKey": CURRENTS_API_KEY,
                     "language": language,
                     "category": category,
+                    "country": country,
                 },
                 timeout=15,
             )
@@ -493,7 +496,8 @@ def escape_drawtext(text: str) -> str:
 
 
 def build_title_caption_filter(
-    text: str,
+    story_number: int,
+    title: str,
     caption_file_path: str,
     font_path: str = TITLE_FONT_PATH,
     out_w: int = VIDEO_WIDTH,
@@ -501,16 +505,16 @@ def build_title_caption_filter(
     palette: dict = None,
 ) -> str:
     """
-    Builds the drawtext filter for the segment's title caption, using the
-    exact same sizing/wrapping/positioning rules as facts.py's top-caption
-    style (_build_single_caption_filter with position="top"): font size
-    scales down as word count grows, text is wrapped to a textfile so long
-    titles don't overflow the frame width, and it's placed top_padding px
-    from the top with a shadow + bordered outline.
+    Builds the drawtext filter for the segment's title caption: a fixed
+    "Story N" line, then the story's own headline wrapped onto the
+    following line(s). Font size still scales down as the headline's word
+    count grows (same rule as before) -- "Story N" is short and fixed, so
+    it isn't part of that word count.
     """
-    escaped = escape_drawtext(text)
+    story_label = f"Story {story_number}"
+    escaped_title = escape_drawtext(title)
 
-    word_count = len(text.split())
+    word_count = len(title.split())
     if word_count <= 5:
         font_size = 100
     elif word_count <= 10:
@@ -522,9 +526,11 @@ def build_title_caption_filter(
     usable_width_px = out_w - 80
     wrap_width_chars = max(int(usable_width_px / avg_char_width_px), 8)
 
-    wrapped = textwrap.fill(escaped, width=wrap_width_chars)
+    wrapped_title = textwrap.fill(escaped_title, width=wrap_width_chars)
+    full_text = f"{story_label}\n{wrapped_title}"
+
     with open(caption_file_path, "w", encoding="utf-8") as f:
-        f.write(wrapped)
+        f.write(full_text)
 
     palette = palette or random.choice(CAPTION_COLOR_PALETTES)
 
@@ -539,20 +545,15 @@ def build_title_caption_filter(
 
 
 def build_segment(article: dict, image_path: str, audio_path: str, position: int, out_path: str) -> str:
-    """
-    Builds one vertical video segment: the article's image, scaled to fit
-    fully inside the frame (letterboxed with black bars, never cropped),
-    held for the exact length of its narration audio, with the short title
-    burned in near the top of the frame -- same font-size/wrap/position/
-    shadow style as facts.py's top caption.
-    """
     duration = get_audio_duration(audio_path)
     palette = CAPTION_COLOR_PALETTES[position % len(CAPTION_COLOR_PALETTES)]
-    title_text = f"{position + 1}/{NUM_STORIES}  {make_short_title(article)}"
 
     caption_file_path = f"{WORKDIR}/caption_title_{position}.txt"
     drawtext = build_title_caption_filter(
-        title_text, caption_file_path, palette=palette,
+        story_number=position + 1,
+        title=make_short_title(article),
+        caption_file_path=caption_file_path,
+        palette=palette,
     )
 
     vf = (
@@ -604,14 +605,111 @@ def concatenate_segments(segment_paths: list[str], out_path: str = FINAL_VIDEO) 
     return out_path
 
 # ---------------------------------------------------------------------------
-# NOTE: the YouTube upload step (OAuth refresh + resumable upload call) is
-# intentionally omitted here for brevity -- add it below build_hourly_digest()
-# using generate_youtube_title(stories[0]) for the title, once you're happy
-# with local output.
+# 7. YouTube upload
 # ---------------------------------------------------------------------------
 
+def yt_refresh_access_token() -> str:
+    res = requests.post(
+        "https://oauth2.googleapis.com/token",
+        data={
+            "client_id": YT_CLIENT_ID,
+            "client_secret": YT_CLIENT_SECRET,
+            "refresh_token": YT_REFRESH_TOKEN,
+            "grant_type": "refresh_token",
+        },
+        timeout=30,
+    )
+    if not res.ok:
+        print(f"YouTube token refresh error body: {res.text}")
+    res.raise_for_status()
+    return res.json()["access_token"]
+
+
+def publish_to_youtube(video_path: str, title: str, description: str, tags=None):
+    """
+    Same OAuth-refresh + resumable-upload flow as facts.py's
+    publish_to_youtube(), with categoryId 25 (News & Politics) instead of
+    27 (Education) to match this content.
+    """
+    try:
+        access_token = yt_refresh_access_token()
+
+        metadata = {
+            "snippet": {
+                "title": title[:YT_TITLE_MAX_LEN],
+                "description": description,
+                "tags": tags or ["news", "shorts", "dailybrief", "top5"],
+                "categoryId": "25",  # News & Politics
+            },
+            "status": {
+                "privacyStatus": YT_PRIVACY_STATUS,
+                "selfDeclaredMadeForKids": False,
+            },
+        }
+
+        init_res = requests.post(
+            "https://www.googleapis.com/upload/youtube/v3/videos"
+            "?uploadType=resumable&part=snippet,status",
+            headers={
+                "Authorization": f"Bearer {access_token}",
+                "Content-Type": "application/json; charset=UTF-8",
+                "X-Upload-Content-Type": "video/mp4",
+            },
+            json=metadata,
+            timeout=30,
+        )
+        if not init_res.ok:
+            print(f"YouTube init error body: {init_res.text}")
+        init_res.raise_for_status()
+        upload_url = init_res.headers["Location"]
+
+        with open(video_path, "rb") as f:
+            video_bytes = f.read()
+
+        upload_res = requests.put(
+            upload_url,
+            headers={"Content-Type": "video/mp4"},
+            data=video_bytes,
+            timeout=180,
+        )
+        if not upload_res.ok:
+            print(f"YouTube upload error body: {upload_res.text}")
+        upload_res.raise_for_status()
+        return upload_res
+    except Exception as e:
+        print(f"YouTube error: {e}")
+        return None
+
+
+def commit_video(video_path: str = FINAL_VIDEO):
+    """
+    Optional: commits and pushes the final digest video to the repo, same
+    pattern as facts.py's commit_video(). Note this isn't required for the
+    YouTube upload itself -- publish_to_youtube() reads the local file's
+    bytes directly, it doesn't need a hosted URL the way the coffee
+    pipeline's Pinterest/Tumblr/Bluesky posting does. Since this pipeline
+    runs hourly rather than daily, committing every run's video will add
+    up fast (~24 video commits/day vs. facts.py's 1/day) and bloat repo
+    history quickly. Call this only if you actually want a persisted
+    archive of past digests; otherwise skip it and let each run's video
+    disappear with the ephemeral runner after upload.
+    """
+    print("Committing video to repo...")
+    subprocess.run(["git", "config", "user.name", "hourly-digest-bot"])
+    subprocess.run(["git", "config", "user.email", "hourly-digest-bot@users.noreply.github.com"])
+    subprocess.run(["git", "add", video_path])
+    commit_result = subprocess.run(["git", "commit", "-m", "Hourly news digest"], capture_output=True, text=True)
+    if commit_result.returncode != 0:
+        print(f"Nothing to commit or commit failed:\n{commit_result.stderr}")
+        return
+    push_result = subprocess.run(["git", "push"], capture_output=True, text=True)
+    if push_result.returncode != 0:
+        print(f"Video push failed:\n{push_result.stderr}")
+    else:
+        print("Video committed and pushed successfully.")
+
 # ---------------------------------------------------------------------------
-# 7. Orchestration
+# 8. Orchestration
 # ---------------------------------------------------------------------------
 
 def build_hourly_digest() -> tuple[str, str, str]:
@@ -661,8 +759,24 @@ def build_hourly_digest() -> tuple[str, str, str]:
     return video_path, title, description
 
 
-if __name__ == "__main__":
-    final_path, title, description = build_hourly_digest()
-    print(f"\nDone. Final video: {final_path}")
+def main():
+    video_path, title, description = build_hourly_digest()
+    print(f"\nDone. Final video: {video_path}")
     print(f"\nTitle: {title}")
     print(f"\nDescription:\n{description}")
+
+    # Uncomment if you want an archived copy of each hourly digest in-repo
+    # (see the size/history caveat in commit_video's docstring):
+    # commit_video(video_path)
+
+    # res = publish_to_youtube(video_path, title, description)
+
+    if res is not None and res.ok:
+        print(f"Uploaded Short: {res.json().get('id')}")
+    else:
+        print("YouTube upload failed; see error above.")
+        raise SystemExit(1)
+
+
+if __name__ == "__main__":
+    main()
