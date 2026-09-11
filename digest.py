@@ -37,6 +37,7 @@ import requests
 
 NEWSDATA_API_URL = "https://newsdata.io/api/1/latest"
 CURRENTS_API_URL = "https://api.currentsapi.services/v1/latest-news"
+PEXELS_SEARCH_URL = "https://api.pexels.com/v1/search"
 NEWS_COUNTRY = "in"  # ISO 3166-1 alpha-2 -- restricts both APIs to India
 
 NEWSDATA_API_KEY = os.environ.get("NEWSDATA_API_KEY", "")
@@ -599,54 +600,6 @@ def escape_drawtext(text: str) -> str:
     text = text.replace("%", "\\%")
     return text
 
-
-def build_title_caption_filter(
-    story_number: int,
-    title: str,
-    caption_file_path: str,
-    font_path: str = TITLE_FONT_PATH,
-    out_w: int = VIDEO_WIDTH,
-    top_padding: int = TITLE_TOP_MARGIN,
-    palette: dict = None,
-) -> str:
-    """
-    Builds the drawtext filter for the segment's title caption: a fixed
-    "Story N" line, then the story's own headline wrapped onto the
-    following line(s). Font size still scales down as the headline's word
-    count grows (same rule as before) -- "Story N" is short and fixed, so
-    it isn't part of that word count.
-    """
-    story_label = f"Story {story_number}"
-    escaped_title = escape_drawtext(title)
-
-    word_count = len(title.split())
-    if word_count <= 5:
-        font_size = 100
-    elif word_count <= 10:
-        font_size = 80
-    else:
-        font_size = 64
-
-    avg_char_width_px = font_size * 0.58
-    usable_width_px = out_w - 80
-    wrap_width_chars = max(int(usable_width_px / avg_char_width_px), 8)
-
-    wrapped_title = textwrap.fill(escaped_title, width=wrap_width_chars)
-    full_text = f"{story_label}\n{wrapped_title}"
-
-    with open(caption_file_path, "w", encoding="utf-8") as f:
-        f.write(full_text)
-
-    palette = palette or random.choice(CAPTION_COLOR_PALETTES)
-
-    return (
-        f"drawtext=fontfile={font_path}:textfile={caption_file_path}:"
-        f"fontsize={font_size}:fontcolor={palette['fontcolor']}:"
-        f"borderw=3:bordercolor={palette['bordercolor']}:"
-        f"shadowcolor=black@0.9:shadowx=3:shadowy=3:"
-        f"text_align=C:"
-        f"x=(w-text_w)/2:y={top_padding}:line_spacing=16"
-    )
 
 def _build_single_title_caption(
     text: str,
