@@ -1,0 +1,62 @@
+name: Hourly News Digest
+
+on:
+  schedule:
+    # Runs at the top of every hour (UTC). GitHub's scheduler is best-effort
+    # and can be delayed a few minutes during high load -- that's fine here
+    # since the title/description are stamped from the run's own timestamp,
+    # not from the cron time.
+    #- cron: "0 * * * *"
+  workflow_dispatch: {}  # allows manual "Run workflow" trigger for testing
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hourly-news-digest
+  cancel-in-progress: false  # let an in-flight run finish rather than killing it mid-render
+
+jobs:
+  build-and-publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install ffmpeg
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg fonts-dejavu-core
+
+      - name: Install Python dependencies
+        run: pip install --upgrade pip && pip install edge-tts requests
+
+      - name: Run hourly digest pipeline
+        env:
+          NEWSDATA_API_KEY: ${{ secrets.NEWSDATA_API_KEY }}
+          CURRENTS_API_KEY: ${{ secrets.CURRENTS_API_KEY }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          YT_CLIENT_ID: ${{ secrets.YT_CLIENT_ID }}
+          YT_CLIENT_SECRET: ${{ secrets.YT_CLIENT_SECRET }}
+          YT_REFRESH_TOKEN: ${{ secrets.YT_REFRESH_TOKEN }}
+          YT_PRIVACY_STATUS: ${{ vars.YT_PRIVACY_STATUS || 'unlisted' }}
+        run: python digest.py
+
+      # The pipeline script currently only builds the video locally and
+      # prints the title/description -- it doesn't upload to YouTube yet.
+      # Until an upload step is added inside hourly_digest.py, this uploads
+      # the rendered video as a workflow artifact so it can still be
+      # inspected/downloaded from each run.
+      - name: Upload rendered video as workflow artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: hourly-digest-${{ github.run_id }}
+          path: assets/hourly_digest.mp4
+          retention-days: 3
+          if-no-files-found: warn
