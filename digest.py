@@ -64,7 +64,7 @@ VIDEO_HEIGHT = 1920  # 9:16, standard Shorts frame
 
 TITLE_FONT_SIZE = 54  # unused now -- font size is computed dynamically per facts.py's word-count rule
 TITLE_TOP_MARGIN = 280  # matches facts.py's top-caption top_padding default
-TITLE_FONT_PATH = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+TITLE_FONT_PATH = "/usr/share/fonts/type/dejavu/DejaVuSans-Bold.ttf"
 
 CAPTION_COLOR_PALETTES = [
     {"fontcolor": "0xFFEE00", "bordercolor": "0x000000@0.9"},   # bright yellow / black
@@ -782,7 +782,7 @@ def publish_to_youtube(video_path: str, title: str, description: str, tags=None)
             "status": {
                 "privacyStatus": YT_PRIVACY_STATUS,
                 "selfDeclaredMadeForKids": False,
-                "containsSyntheticMedia": true,
+                "containsSyntheticMedia": True,
             },
         }
 
