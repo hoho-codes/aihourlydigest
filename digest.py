@@ -558,16 +558,96 @@ def build_title_caption_filter(
         f"x=(w-text_w)/2:y={top_padding}:line_spacing=16"
     )
 
+def _build_single_title_caption(
+    text: str,
+    caption_file_path: str,
+    font_path: str = TITLE_FONT_PATH,
+    out_w: int = VIDEO_WIDTH,
+    position: str = "top",
+    top_padding: int = TITLE_TOP_MARGIN,
+    bottom_padding: int = 220,
+    palette: dict = None,
+) -> str:
+    """
+    Builds one drawtext filter -- same sizing/wrap/shadow/outline rules as
+    before, but now usable at either the top or bottom of the frame so
+    "Story N" and the headline can be placed separately.
+    """
+    escaped = escape_drawtext(text)
+
+    word_count = len(text.split())
+    if word_count <= 5:
+        font_size = 100
+    elif word_count <= 10:
+        font_size = 80
+    else:
+        font_size = 64
+
+    avg_char_width_px = font_size * 0.58
+    usable_width_px = out_w - 80
+    wrap_width_chars = max(int(usable_width_px / avg_char_width_px), 8)
+
+    wrapped = textwrap.fill(escaped, width=wrap_width_chars)
+    with open(caption_file_path, "w", encoding="utf-8") as f:
+        f.write(wrapped)
+
+    palette = palette or random.choice(CAPTION_COLOR_PALETTES)
+    y_expr = f"{top_padding}" if position == "top" else f"h-text_h-{bottom_padding}"
+
+    return (
+        f"drawtext=fontfile={font_path}:textfile={caption_file_path}:"
+        f"fontsize={font_size}:fontcolor={palette['fontcolor']}:"
+        f"borderw=3:bordercolor={palette['bordercolor']}:"
+        f"shadowcolor=black@0.9:shadowx=3:shadowy=3:"
+        f"text_align=C:"
+        f"x=(w-text_w)/2:y={y_expr}:line_spacing=16"
+    )
+
+
+def build_title_caption_filter(
+    story_number: int,
+    title: str,
+    story_caption_path: str,
+    title_caption_path: str,
+    font_path: str = TITLE_FONT_PATH,
+    out_w: int = VIDEO_WIDTH,
+    top_padding: int = TITLE_TOP_MARGIN,
+    bottom_padding: int = 220,
+    palette: dict = None,
+) -> str:
+    """
+    "Story N" stays fixed near the top (same spot as before); the
+    headline itself moves to the bottom of the frame -- same top/bottom
+    split as facts.py's two-part caption (hook top, answer bottom). Both
+    pieces share one palette so they read as a matched pair.
+    """
+    palette = palette or random.choice(CAPTION_COLOR_PALETTES)
+
+    story_filter = _build_single_title_caption(
+        f"Story {story_number}", story_caption_path,
+        font_path=font_path, out_w=out_w,
+        position="top", top_padding=top_padding,
+        palette=palette,
+    )
+    title_filter = _build_single_title_caption(
+        title, title_caption_path,
+        font_path=font_path, out_w=out_w,
+        position="bottom", bottom_padding=bottom_padding,
+        palette=palette,
+    )
+    return f"{story_filter},{title_filter}"
 
 def build_segment(article: dict, image_path: str, audio_path: str, position: int, out_path: str) -> str:
     duration = get_audio_duration(audio_path)
     palette = CAPTION_COLOR_PALETTES[position % len(CAPTION_COLOR_PALETTES)]
 
-    caption_file_path = f"{WORKDIR}/caption_title_{position}.txt"
+    story_caption_path = f"{WORKDIR}/caption_story_{position}.txt"
+    title_caption_path = f"{WORKDIR}/caption_headline_{position}.txt"
     drawtext = build_title_caption_filter(
         story_number=position + 1,
         title=make_short_title(article),
-        caption_file_path=caption_file_path,
+        story_caption_path=story_caption_path,
+        title_caption_path=title_caption_path,
         palette=palette,
     )
 
