@@ -1,12 +1,12 @@
 name: Hourly News Digest
 
 on:
-  # schedule:
+  schedule:
     # Runs at the top of every hour (UTC). GitHub's scheduler is best-effort
     # and can be delayed a few minutes during high load -- that's fine here
     # since the title/description are stamped from the run's own timestamp,
     # not from the cron time.
-    #- cron: "0 * * * *" 
+    - cron: "0 * * * *" 
   workflow_dispatch: {}  # allows manual "Run workflow" trigger for testing
 
 permissions:
