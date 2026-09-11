@@ -234,26 +234,28 @@ def fetch_five_stories() -> list[dict]:
     return articles
 
 
-def rank_five_stories_with_groq(articles: list[dict]) -> list[dict]:
+def rank_stories_with_groq(articles: list[dict]) -> list[dict]:
     """
-    Asks Groq to rank the fetched candidates by newsworthiness and returns
-    its top NUM_STORIES picks, in order. Falls back to the original fetch
-    order if Groq is unavailable or its reply can't be parsed.
+    Ranks ALL fetched candidates by newsworthiness, most to least
+    important, and returns them in that order -- not just the top
+    NUM_STORIES -- so the caller can fall through to the next-best
+    story if an earlier pick has to be skipped (e.g. no usable image).
+    Falls back to the original fetch order if Groq is unavailable or
+    its reply can't be parsed.
     """
-    if not GROQ_API_KEY or len(articles) <= NUM_STORIES:
-        return articles[:NUM_STORIES]
+    if not GROQ_API_KEY or len(articles) <= 1:
+        return articles
 
     numbered = "\n".join(
         f"{i + 1}. {a['title']} -- {a['description']}" for i, a in enumerate(articles)
     )
     system_instruction = (
-        f"You are ranking news stories for an hourly top-{NUM_STORIES} news "
-        "digest video aimed at a general audience. You will be given a "
-        "numbered list of candidate stories (title -- description). Pick "
-        f"the {NUM_STORIES} most newsworthy, timely, and broadly relevant "
-        "stories, ordered from most to least important. "
-        "Return ONLY the chosen numbers separated by commas, e.g. '3,1,7,2,5', "
-        "nothing else."
+        "You are ranking news stories for an hourly news digest video aimed "
+        "at a general audience. You will be given a numbered list of "
+        "candidate stories (title -- description). Rank ALL of them from "
+        "most to least newsworthy, timely, and broadly relevant. "
+        "Return ONLY the numbers of every story, most important first, "
+        "separated by commas, e.g. '3,1,7,2,5,4,6', nothing else."
     )
 
     try:
@@ -269,7 +271,7 @@ def rank_five_stories_with_groq(articles: list[dict]) -> list[dict]:
                     {"role": "system", "content": system_instruction},
                     {"role": "user", "content": numbered},
                 ],
-                "max_tokens": 200,
+                "max_tokens": 300,
                 "temperature": 0.5,
                 "reasoning_effort": "low",
             },
@@ -278,20 +280,23 @@ def rank_five_stories_with_groq(articles: list[dict]) -> list[dict]:
         res.raise_for_status()
         raw = res.json()["choices"][0]["message"]["content"].strip()
         indices = [int(tok) - 1 for tok in raw.replace(" ", "").split(",") if tok.strip().isdigit()]
-        chosen = [articles[i] for i in indices if 0 <= i < len(articles)]
+        ranked = [articles[i] for i in indices if 0 <= i < len(articles)]
+
         deduped, seen_idx = [], set()
-        for a in chosen:
-            key = a["title"]
-            if key not in seen_idx:
+        for a in ranked:
+            if a["title"] not in seen_idx:
                 deduped.append(a)
-                seen_idx.add(key)
-        if len(deduped) >= NUM_STORIES:
-            print(f"Groq ranked top {NUM_STORIES} stories.")
-            return deduped[:NUM_STORIES]
-        raise ValueError(f"Groq returned too few valid picks: {raw!r}")
+                seen_idx.add(a["title"])
+        for a in articles:  # safety net for anything Groq's reply missed
+            if a["title"] not in seen_idx:
+                deduped.append(a)
+                seen_idx.add(a["title"])
+
+        print(f"Groq ranked all {len(deduped)} candidate stories.")
+        return deduped
     except Exception as e:
-        print(f"rank_five_stories_with_groq failed ({e}); using original fetch order.")
-        return articles[:NUM_STORIES]
+        print(f"rank_stories_with_groq failed ({e}); using original fetch order.")
+        return articles
 
 # ---------------------------------------------------------------------------
 # 2. Write a ~60-second script for each story
@@ -723,13 +728,6 @@ def commit_video(video_path: str = FINAL_VIDEO):
 # ---------------------------------------------------------------------------
 
 def build_hourly_digest() -> tuple[str, str, str]:
-    """
-    Returns (video_path, title, description). The title/description are
-    built only from the stories that actually made it into the final cut
-    (i.e. after skipping any with no usable image), in their final order,
-    so the description's story list always matches what's really in the
-    video.
-    """
     os.makedirs(WORKDIR, exist_ok=True)
     run_time = datetime.now(timezone.utc)
 
@@ -737,21 +735,22 @@ def build_hourly_digest() -> tuple[str, str, str]:
     if not candidates:
         raise SystemExit("No usable stories fetched this hour; aborting.")
 
-    ranked = rank_five_stories_with_groq(candidates)
-    print(f"Building digest from {len(ranked)} ranked stories.")
+    ranked = rank_stories_with_groq(candidates)
+    print(f"Have {len(ranked)} ranked candidates; assembling top {NUM_STORIES}.")
 
     segment_paths = []
     used_stories = []
-    for i, article in enumerate(ranked):
-        # position in used_stories, not in ranked, since a skipped story
-        # would otherwise leave a gap in the "N/5" caption numbering
+    for article in ranked:
+        if len(used_stories) >= NUM_STORIES:
+            break
+
         position = len(used_stories)
         image_path = download_article_image(article, out_path=f"{WORKDIR}/image_{position}.png")
         if image_path is None:
             print(f"Skipping story (no usable image): {article['title']}")
             continue
 
-        script = write_segment_script(article, position=position + 1, total=len(ranked))
+        script = write_segment_script(article, position=position + 1, total=NUM_STORIES)
         audio_path = generate_narration(script, out_path=f"{WORKDIR}/audio_{position}.mp3")
         segment_path = build_segment(
             article, image_path, audio_path, position=position,
@@ -762,6 +761,9 @@ def build_hourly_digest() -> tuple[str, str, str]:
 
     if not segment_paths:
         raise SystemExit("Every candidate story lacked a usable image; aborting.")
+    if len(segment_paths) < NUM_STORIES:
+        print(f"Warning: only assembled {len(segment_paths)}/{NUM_STORIES} stories "
+              f"this run (ran out of candidates with usable images).")
 
     video_path = concatenate_segments(segment_paths)
     title = generate_youtube_title(run_time)
